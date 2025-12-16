@@ -25,6 +25,9 @@ class SecureClient:
         try:
             #creates TCP socket
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Increase buffer sizes for file transfer
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
             #connects to the server
             self.sock.connect((self.server_host, self.server_port))
             #performs TLS-like server authentication
@@ -108,103 +111,143 @@ class SecureClient:
         self.username = None
 
     def send_file(self, file_path):
+        print(f"[DEBUG] Starting file transfer for: {file_path}")
+        
         #ensures user is authenticated
         if not self.username:
             print("You must be logged in to send files")
             return
+        
         #validates file existence
         if not os.path.exists(file_path):
             print(f"File not found: {file_path}")
             return
+        
         #server must approve transfer
         resp = self.send({'action': 'transfer'})
         if not resp.get('success'):
             print(resp.get('message', 'Cannot start transfer'))
             return
 
-        #receive server public key
-        server_pub_pem = b''
-        while b'-----END PUBLIC KEY-----' not in server_pub_pem:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("Server closed connection while sending public key")
-            server_pub_pem += chunk
-        #loads server RSA key
-        public_key = serialization.load_pem_public_key(server_pub_pem, backend=default_backend())
+        # Set timeout for file transfer
+        self.sock.settimeout(30)
+        
+        try:
+            #receive server public key
+            server_pub_pem = b''
+            while b'-----END PUBLIC KEY-----' not in server_pub_pem:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Server closed connection while sending public key")
+                server_pub_pem += chunk
+            
+            #loads server RSA key
+            public_key = serialization.load_pem_public_key(server_pub_pem, backend=default_backend())
 
-        #read file
-        with open(file_path, 'rb') as f:
-            file_data = f.read()
-        filename = os.path.basename(file_path)
-        filesize = len(file_data)
+            #read file
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+            filename = os.path.basename(file_path)
+            filesize = len(file_data)
 
-        print(f"Sending file: {filename} ({self._format_size(filesize)})")
+            print(f"Sending file: {filename} ({self._format_size(filesize)})")
 
-        #generate random  256 bit AES key and encrypt with RSA
-        aes_key = os.urandom(32)
-        encrypted_aes_key = public_key.encrypt(
-            aes_key,
-            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-        )
-        #length prefix framing
-        self.sock.send(len(encrypted_aes_key).to_bytes(4, 'big'))
-        self.sock.send(encrypted_aes_key)
+            #generate random 256 bit AES key and encrypt with RSA
+            aes_key = os.urandom(32)
+            encrypted_aes_key = public_key.encrypt(
+                aes_key,
+                padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+            )
+            
+            print(f"[DEBUG] Encrypted AES key: {len(encrypted_aes_key)} bytes")
+            
+            #length prefix framing
+            self.sock.send(len(encrypted_aes_key).to_bytes(4, 'big'))
+            self.sock.send(encrypted_aes_key)
 
-        #encrypt and send metadata
-        metadata = {
-            'username': self.username,
-            'filename': filename,
-            'filesize': filesize,
-            'hash': hashlib.sha256(file_data).hexdigest() #SHA-256 hash
-        }
-        nonce = os.urandom(12)
-        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce), backend=default_backend())
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(json.dumps(metadata).encode()) + encryptor.finalize()
-        encrypted_meta = {
-            'ciphertext': base64.b64encode(ciphertext).decode(),
-            'nonce': base64.b64encode(nonce).decode(),
-            'tag': base64.b64encode(encryptor.tag).decode()
-        }
-        meta_bytes = json.dumps(encrypted_meta).encode()
-        self.sock.send(len(meta_bytes).to_bytes(4, 'big'))
-        self.sock.send(meta_bytes)
+            #encrypt and send metadata
+            metadata = {
+                'username': self.username,
+                'filename': filename,
+                'filesize': filesize,
+                'hash': hashlib.sha256(file_data).hexdigest() #SHA-256 hash
+            }
+            nonce = os.urandom(12)
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce), backend=default_backend())
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(json.dumps(metadata).encode()) + encryptor.finalize()
+            encrypted_meta = {
+                'ciphertext': base64.b64encode(ciphertext).decode(),
+                'nonce': base64.b64encode(nonce).decode(),
+                'tag': base64.b64encode(encryptor.tag).decode()
+            }
+            meta_bytes = json.dumps(encrypted_meta).encode()
+            
+            print(f"[DEBUG] Metadata size: {len(meta_bytes)} bytes")
+            
+            self.sock.send(len(meta_bytes).to_bytes(4, 'big'))
+            self.sock.send(meta_bytes)
 
-        ready = self.sock.recv(1024)
-        #ensures protocol synchronization
-        if ready.strip() != b"READY":
-            print("Server not ready")
-            return
+            ready = self.sock.recv(1024)
+            print(f"[DEBUG] Server response after metadata: {ready}")
+            
+            #ensures protocol synchronization
+            if ready.strip() != b"READY":
+                print(f"Server not ready. Received: {ready}")
+                return
 
-        nonce = os.urandom(12)
-        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce), backend=default_backend())
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(file_data) + encryptor.finalize()
-        encrypted_package = {
-            'ciphertext': base64.b64encode(ciphertext).decode(),
-            'nonce': base64.b64encode(nonce).decode(),
-            'tag': base64.b64encode(encryptor.tag).decode()
-        }
-        encrypted_bytes = json.dumps(encrypted_package).encode()
+            # Encrypt file data
+            nonce = os.urandom(12)
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce), backend=default_backend())
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(file_data) + encryptor.finalize()
+            
+            # Create encrypted package
+            encrypted_package = {
+                'ciphertext': base64.b64encode(ciphertext).decode(),
+                'nonce': base64.b64encode(nonce).decode(),
+                'tag': base64.b64encode(encryptor.tag).decode()
+            }
+            encrypted_bytes = json.dumps(encrypted_package).encode()
+            
+            print(f"[DEBUG] Encrypted package size: {len(encrypted_bytes)} bytes")
 
-        chunk_size = 4096
-        sent = 0
-        #sends file in chunks
-        for i in range(0, len(encrypted_bytes), chunk_size):
-            chunk = encrypted_bytes[i:i + chunk_size]
-            self.sock.send(len(chunk).to_bytes(4, 'big')) #length-prefixed framing
-            self.sock.send(chunk)
-            sent += len(chunk)
-            #displays progress bar
-            print(f"\rProgress: {sent / len(encrypted_bytes) * 100:.1f}%", end='')
-        print()
-
-        resp = self.sock.recv(1024)
-        #confirms successful transfer
-        if resp.strip() == b"SUCCESS":
-            print("File sent successfully")
-        else:
-            print(f"File transfer failed: {resp.decode()}")
+            # Send file in chunks
+            chunk_size = 4096
+            sent = 0
+            total_size = len(encrypted_bytes)
+            
+            # Send all chunks first
+            for i in range(0, total_size, chunk_size):
+                chunk = encrypted_bytes[i:i + chunk_size]
+                self.sock.send(len(chunk).to_bytes(4, 'big')) #length-prefixed framing
+                self.sock.send(chunk)
+                sent += len(chunk)
+                #displays progress bar
+                progress = sent / total_size * 100
+                print(f"\rProgress: {progress:.1f}% ({self._format_size(sent)}/{self._format_size(total_size)})", end='')
+            
+            # Send final zero-length chunk to indicate end
+            self.sock.send((0).to_bytes(4, 'big'))
+            print(f"\n[DEBUG] All data sent. Waiting for server response...")
+            
+            # Get response from server
+            resp = self.sock.recv(1024)
+            print(f"[DEBUG] Server final response: {resp}")
+            
+            #confirms successful transfer
+            if resp.strip() == b"SUCCESS":
+                print("File sent successfully")
+            else:
+                print(f"File transfer failed: {resp.decode()}")
+                
+        except socket.timeout:
+            print("File transfer timeout")
+        except Exception as e:
+            print(f"Error during file transfer: {e}")
+        finally:
+            # Reset timeout
+            self.sock.settimeout(None)
 
     def quit(self):
         if self.sock:
