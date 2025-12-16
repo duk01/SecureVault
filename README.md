@@ -1,33 +1,31 @@
 # SecureVault
 
 ----------------------------------------------------------------------------------------------------------------------------
-*** WEEK 2 ***
+*** WEEK 2 *** (aes.py, aes.csv)
 
   1. Run aes.py
   2. Output shows decryption
      
 ----------------------------------------------------------------------------------------------------------------------------
-*** WEEK 3 ***
+*** WEEK 3 *** (main.py)
 
   1. Run main.py
   2. Enter message
   3. Outputs ciphertext, then back to plaintext
      
 ----------------------------------------------------------------------------------------------------------------------------
-*** WEEK 4 ***
+*** WEEK 4 *** (hybrid.py, secret.txt)
 
-  1. Generate keys:
+1. Generate keys:
      python hybrid.py genkeys
-  2. Encrypt a file:
+2. Encrypt a file:
      python hybrid.py encrypt secret.txt public.pem
-
-                  OR
-
-  3. Encrypt text:
+             OR
+3. Encrypt text:
      python hybrid.py encrypt-text "Hello World" public.pem
-  4. Decrypt:
+4. Decrypt:
      python hybrid.py decrypt encrypted.json private.pem
-  5. Decrypt with custom output:
+5. Decrypt with custom output:
      python hybrid.py decrypt encrypted.json private.pem result.txt
 
 ENCRYPTION PROCESS:
@@ -37,7 +35,7 @@ ENCRYPTION PROCESS:
   4. Package everything together
 
 ----------------------------------------------------------------------------------------------------------------------------
-*** WEEK 5-10 ***
+*** WEEK 5-10 *** (secure_server.py, secure_client.py, /attacks folder)
 
 TO RUN NORMALLY :
 
